@@ -19,13 +19,17 @@ import { RegisterDto } from './dto/register.dto';
 import { ResendVerificationDto } from './dto/resend-verification.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
+import { VerifyPasswordResetOtpDto } from './dto/verify-password-reset-otp.dto';
 import { VerificationOtpSource } from './entities/verification-otp.entity';
 import { JwtPayload } from './strategies/jwt.strategy';
 import { VerificationOtpService } from './verification-otp.service';
 import { PasswordResetOtpService } from './password-reset-otp.service';
 import { PasswordResetQueueService } from './password-reset-queue.service';
 import { GoogleProfile } from './strategies/google.strategy';
-import { type OAuthSignupRole } from './oauth-signup-role';
+import {
+  normalizeOAuthSignupRole,
+  type OAuthSignupRole,
+} from './oauth-signup-role';
 import {
   BadRequestError,
   ErrorMessages,
@@ -82,6 +86,11 @@ export interface ForgotPasswordResponse {
 }
 
 export interface ResetPasswordResponse {
+  status: 'success';
+  message: string;
+}
+
+export interface VerifyPasswordResetOtpResponse {
   status: 'success';
   message: string;
 }
@@ -239,6 +248,25 @@ export class AuthService {
     };
   }
 
+  async verifyPasswordResetOtp(
+    dto: VerifyPasswordResetOtpDto,
+  ): Promise<VerifyPasswordResetOtpResponse> {
+    const user = await this.usersService.findByEmail(dto.email.trim());
+    if (!user) {
+      throw new BadRequestError(ErrorMessages.AUTH.INVALID_OR_EXPIRED_OTP);
+    }
+
+    const valid = await this.passwordResetOtpService.verify(user.id, dto.otp);
+    if (!valid) {
+      throw new BadRequestError(ErrorMessages.AUTH.INVALID_OR_EXPIRED_OTP);
+    }
+
+    return {
+      status: 'success',
+      message: SuccessMessages.AUTH.PASSWORD_RESET_OTP_VERIFIED,
+    };
+  }
+
   async resetPassword(dto: ResetPasswordDto): Promise<ResetPasswordResponse> {
     const user = await this.usersService.findByEmail(dto.email.trim());
     if (!user) {
@@ -273,6 +301,73 @@ export class AuthService {
     };
 
     return this.finalizeOAuthLogin('google', normalizedProfile, signupRole);
+  }
+
+  async verifyGoogleAuthCode(
+    code: string,
+    redirectUri: string = 'postmessage',
+    signupRole?: string,
+  ): Promise<AuthResult> {
+    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        code,
+        client_id: env.GOOGLE_CLIENT_ID,
+        client_secret: env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code',
+      }),
+    });
+
+    if (!tokenResponse.ok) {
+      const errorText = await tokenResponse.text();
+      this.logger.error(`Google token exchange failed: ${errorText}`);
+      throw new BadRequestError('Failed to exchange Google authorization code');
+    }
+
+    const tokens = (await tokenResponse.json()) as { access_token: string };
+
+    const profileResponse = await fetch(
+      'https://www.googleapis.com/oauth2/v2/userinfo',
+      {
+        headers: {
+          Authorization: `Bearer ${tokens.access_token}`,
+        },
+      },
+    );
+
+    if (!profileResponse.ok) {
+      const errorText = await profileResponse.text();
+      this.logger.error(`Google profile fetch failed: ${errorText}`);
+      throw new BadRequestError('Failed to fetch Google profile');
+    }
+
+    const profileData = (await profileResponse.json()) as {
+      id: string;
+      email: string;
+      given_name?: string;
+      name?: string;
+      family_name?: string;
+      picture?: string;
+    };
+
+    const normalizedProfile: OAuthProfilePayload = {
+      providerId: profileData.id,
+      email: profileData.email,
+      firstName: profileData.given_name || profileData.name || 'User',
+      lastName: profileData.family_name || '',
+      avatarUrl: profileData.picture || null,
+    };
+
+    let parsedRole: OAuthSignupRole | undefined;
+    if (signupRole) {
+      parsedRole = normalizeOAuthSignupRole(signupRole) || undefined;
+    }
+
+    return this.finalizeOAuthLogin('google', normalizedProfile, parsedRole);
   }
 
   async refresh(
