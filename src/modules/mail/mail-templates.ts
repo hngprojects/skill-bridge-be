@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { InternalServerError } from '../../shared';
 
 const templateCache = new Map<string, string>();
 
@@ -7,7 +8,15 @@ export function loadMailTemplateFile(filename: string): string {
   const cached = templateCache.get(filename);
   if (cached) return cached;
   const path = join(__dirname, 'templates', filename);
-  const raw = readFileSync(path, 'utf8');
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new InternalServerError(
+      `Mail template "${filename}" could not be loaded: ${cause}`,
+    );
+  }
   templateCache.set(filename, raw);
   return raw;
 }
