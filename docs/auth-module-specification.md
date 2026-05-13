@@ -62,7 +62,9 @@ CREATE TABLE users (
   first_name          VARCHAR(100)  NOT NULL,
   last_name           VARCHAR(100)  NOT NULL,
   email               VARCHAR(255)  NOT NULL UNIQUE,
-  password_hash       VARCHAR(255)  NULL,            -- NULL for OAuth-only accounts
+  password            VARCHAR(255)  NULL,            -- NULL for OAuth-only accounts
+  signup_reason       VARCHAR(255)  NULL,
+  refresh_token_hash  VARCHAR(500)  NULL,
   country             VARCHAR(100)  NOT NULL,
   role                VARCHAR(20)   NOT NULL DEFAULT 'talent', -- talent | employer | admin
   is_verified         BOOLEAN       NOT NULL DEFAULT false,
@@ -86,16 +88,19 @@ CREATE TABLE user_oauth_accounts (
 );
 ```
 
-### `refresh_tokens`
+### `verification_otps`
+
+Stores hashed one-time passcodes used for email verification. Each OTP is tied to a user, has an expiry time, and tracks whether it has been used and what action triggered it (e.g. initial signup or resend request).
 
 ```sql
-CREATE TABLE refresh_tokens (
-  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id      UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  token_hash   VARCHAR   NOT NULL,
-  expires_at   TIMESTAMP NOT NULL,
-  revoked      BOOLEAN   NOT NULL DEFAULT false,
-  created_at   TIMESTAMP NOT NULL DEFAULT NOW()
+CREATE TABLE verification_otps (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  otp_hash        VARCHAR   NOT NULL,
+  expires_at      TIMESTAMP NOT NULL,
+  used_at         TIMESTAMP,
+  request_source  VARCHAR(20) NOT NULL DEFAULT 'initial',
+  created_at      TIMESTAMP NOT NULL DEFAULT NOW()
 );
 ```
 
@@ -346,6 +351,8 @@ POST /auth/login
 
 #### A4. Password Reset
 
+Password reset uses the `password_reset_otps` table (see Database Schema section). Each OTP is hashed with argon2, has a 15-minute TTL by default, and can only be used once.
+
 ```
 Step 1 — Request reset
   POST /auth/forgot-password { email }
@@ -377,7 +384,7 @@ Step 3 — Submit new password
     ├── Validate password === confirmPassword (DTO) → mismatch → 400
     │
     ├── Hash new password with argon2 → UPDATE users SET password = $hash
-    ├── NULL OUT refreshTokenHash → revokes all active sessions on all devices
+    ├── Revoke all sessions (UPDATE users SET refresh_token_hash = NULL WHERE id = user_id)
     │
     └── Response: 200 { status: "success", message: "Password updated. Please log in." }
 ```
@@ -461,15 +468,15 @@ Client receives 401 on any protected endpoint (access token expired)
         (refresh token sent automatically via httpOnly cookie — no JS access)
         │
         ├── Backend reads refresh token from cookie
-        ├── Look up token_hash in refresh_tokens table
-        │     ├── Not found → 401 { status: "error", message: "Session not found. Please log in." }
-        │     ├── Expired  → 401 { status: "error", message: "Session expired. Please log in." }
-        │     └── Revoked  → 401 { status: "error", message: "Session revoked. Please log in." }
+        ├── Verify refresh_token_hash in users table (WHERE id = user_id_from_jwt)
+        │     ├── Not found or NULL → 401 { status: "error", message: "Session not found. Please log in." }
+        │     ├── Hash mismatch → 401 { status: "error", message: "Invalid session. Please log in." }
+        │     └── Expired (check JWT exp) → 401 { status: "error", message: "Session expired. Please log in." }
         │
         ├── Valid token:
-        │     REVOKE old refresh token (UPDATE refresh_tokens SET revoked = true)
         │     Issue new access token (JWT, 15min)
-        │     Issue new refresh token → set new httpOnly cookie
+        │     Generate new refresh token → hash and UPDATE users SET refresh_token_hash = $new_hash
+        │     Set new refresh token as httpOnly cookie
         │     ⚠ This is token rotation — prevents refresh token replay attacks
         │
         └── Response: 200 { status: "success", message: "Token refreshed" }
@@ -486,8 +493,8 @@ POST /auth/logout
   │
   ├── Validate access_token cookie
   ├── Extract user_id from JWT payload
-  ├── Revoke current refresh token (UPDATE refresh_tokens SET revoked = true WHERE user_id = $id)
-  ├── Clear httpOnly cookie
+  ├── Revoke current refresh token (UPDATE users SET refresh_token_hash = NULL WHERE id = $id)
+  ├── Clear httpOnly cookies (access_token and refresh_token)
   │
   └── Response: 200 { status: "success", message: "Logged out" }
 ```
@@ -705,7 +712,7 @@ Revoke current session.
 401  { "status": "error", "message": "Unauthorized" }
 ```
 
-> Both httpOnly cookies cleared. Refresh token revoked in DB.
+> Both httpOnly cookies cleared. Refresh token revoked in DB (`refresh_token_hash` set to NULL).
 
 ---
 
@@ -780,7 +787,7 @@ Set a new password using a 6-digit OTP sent to the user's email.
 400  { "status": "error", "message": "Passwords do not match" }
 ```
 
-> All active sessions for the user are revoked on success (refreshTokenHash is nulled out).
+> All active sessions for the user are revoked on success (`refresh_token_hash` is set to NULL).
 
 ---
 
@@ -857,7 +864,7 @@ Get the currently authenticated user. Cookie sent automatically.
 | Role selection is required               | OAuth and email users must complete onboarding before dashboard access                             |
 | Employers must supply company name       | Required field during onboarding, not optional                                                     |
 | Talent users must select a role track    | Required to enter the assessment pipeline                                                          |
-| Password reset revokes all sessions      | All refresh tokens for the user are revoked on reset                                               |
+| Password reset revokes all sessions      | User's refresh_token_hash is set to NULL on reset (single-session model)                           |
 | Admin accounts are not self-registerable | Provisioned directly or via internal endpoint                                                      |
 | Auto-link on OAuth conflict              | If OAuth email matches existing account, accounts are silently linked via `user_oauth_accounts`    |
 | Tokens never in response body            | Both access and refresh tokens are httpOnly cookies only — response body contains user object only |
@@ -866,17 +873,17 @@ Get the currently authenticated user. Cookie sent automatically.
 
 ## Security Requirements
 
-| Requirement                  | Detail                                                                                                                   |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Password hashing             | Argon, cost factor 12                                                                                                    |
-| Access token storage         | `httpOnly`, `Secure`, `SameSite=Strict` cookie — 15min TTL                                                               |
-| Refresh token storage        | `httpOnly`, `Secure`, `SameSite=Strict` cookie — 7 days TTL                                                              |
-| Token rotation               | Refresh tokens rotate on every use — old token immediately revoked                                                       |
-| Rate limiting                | `/auth/login`: 5 req/min per IP · `/auth/forgot-password`: 5 req/min · `/auth/resend-verification`: 3 per hour per email |
-| Email enumeration prevention | Forgot password always returns 200 regardless of email existence                                                         |
-| Token TTLs                   | Access: 15min · Refresh: 7 days · Email verification OTP: 15min (`VERIFICATION_OTP_EXPIRES_IN`) · Password reset: 1hr    |
-| HTTPS only                   | All auth endpoints require TLS in production                                                                             |
-| CORS credentials             | `credentials: true` required on backend — mobile uses `withCredentials: true` on Axios                                   |
+| Requirement                  | Detail                                                                                                                                    |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Password hashing             | Argon, cost factor 12                                                                                                                     |
+| Access token storage         | `httpOnly`, `Secure`, `SameSite=Strict` cookie — 15min TTL                                                                                |
+| Refresh token storage        | `httpOnly`, `Secure`, `SameSite=Strict` cookie — 7 days TTL · Hashed value stored in `users.refresh_token_hash` (single session per user) |
+| Token rotation               | Refresh tokens rotate on every use — hash updated in users table                                                                          |
+| Rate limiting                | `/auth/login`: 5 req/min per IP · `/auth/forgot-password`: 5 req/min · `/auth/resend-verification`: 3 per hour per email                  |
+| Email enumeration prevention | Forgot password always returns 200 regardless of email existence                                                                          |
+| Token TTLs                   | Access: 15min · Refresh: 7 days · Email verification OTP: 15min (`VERIFICATION_OTP_EXPIRES_IN`) · Password reset: 1hr                     |
+| HTTPS only                   | All auth endpoints require TLS in production                                                                                              |
+| CORS credentials             | `credentials: true` required on backend — mobile uses `withCredentials: true` on Axios                                                    |
 
 ---
 
@@ -890,4 +897,4 @@ Settled decisions are marked with a check. Remaining items need team agreement b
 4. **Resend verification endpoint** — `POST /auth/resend-verification` included. Rate limited to 3/hr per email.
 5. **Mobile cookie strategy** — Mobile uses Axios interceptors to extract and attach cookies manually. Backend unchanged.
 6. **Talent role track change** — A talent user can change their role track after onboarding.
-7. **No session limits** — For now, the MVP, there's no session limit implemented.
+7. **Single-session model** — Users can only have one active session at a time. Logging in from a new device/browser overwrites the refresh token, invalidating the previous session. This is enforced by storing `refresh_token_hash` directly on the `users` table rather than in a separate sessions table.
